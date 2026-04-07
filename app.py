@@ -503,52 +503,179 @@ def is_everbank(pages):
     return any(re.search(r'EverBank', p, re.I) for p in pages)
 
 
+def fix_everbank_doubled_text(text):
+    """
+    EverBank PDFs often have a broken font encoding where characters
+    are rendered 2-4x in a row due to overlapping glyphs.
+    This function detects and collapses doubled lines.
+    Only applied per-line — lines with normal text are left untouched.
+    """
+    fixed = []
+    for line in text.splitlines():
+        fixed.append(_fix_doubled_line(line))
+    return "\n".join(fixed)
+
+
+def _fix_doubled_line(line):
+    if len(line) < 6:
+        return line
+    alpha = [c for c in line if c.isalpha()]
+    if len(alpha) < 6:
+        return line
+
+    # Try repeat factors 2, 3, 4 — pick whichever has highest ratio
+    best_factor, best_ratio = 1, 0.0
+    for factor in [2, 3, 4]:
+        chunks = [alpha[i:i+factor] for i in range(0, len(alpha) - factor + 1, factor)]
+        if not chunks:
+            continue
+        repeated = sum(1 for chunk in chunks
+                       if len(set(c.lower() for c in chunk)) == 1)
+        ratio = repeated / len(chunks)
+        if ratio > best_ratio:
+            best_ratio, best_factor = ratio, factor
+
+    if best_ratio < 0.65 or best_factor == 1:
+        return line  # Not a doubled line
+
+    # Collapse runs of identical letters by the repeat factor
+    result = []
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch.isalpha():
+            j = i
+            while j < len(line) and line[j].lower() == ch.lower():
+                j += 1
+            run = line[i:j]
+            keep = max(1, round(len(run) / best_factor))
+            upper_chars = [c for c in run if c.isupper()]
+            chosen = upper_chars[0] if upper_chars else ch
+            result.append(chosen * keep)
+            i = j
+        else:
+            result.append(ch)
+            i += 1
+    return "".join(result)
+
+
+def _extract_everbank_address(p1_raw, holder_name):
+    """
+    EverBank page 1 is a two-column layout that pdfplumber merges into one line:
+      '748 BAROSSA VALLEY DR NW  Days in stmt period: 90'
+      'CONCORD NC 28027-8019  (0 )'
+    Strip the right-column content and extract clean address components.
+    """
+    RIGHT_COL = re.compile(
+        r'\s+(?:January|February|March|April|May|June|July|August|'
+        r'September|October|November|December|Days\s+in|Page\s+\d|\(\d\s*\))',
+        re.I
+    )
+    addr_lines = []
+    found_holder = False
+
+    for line in p1_raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        clean = RIGHT_COL.split(line)[0].strip()
+        if holder_name and holder_name.upper() in line.upper():
+            found_holder = True
+            continue
+        if found_holder:
+            if re.match(r'^(Page|Direct|EverBank|888|301|Jacksonville|Account|Summary)', clean, re.I):
+                break
+            if clean:
+                addr_lines.append(clean)
+
+    street, apt_suite, city, state, zipcode = None, None, None, None, None
+    for line in addr_lines:
+        csz = re.match(r'^([A-Za-z\s]+)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)', line)
+        if csz:
+            city, state, zipcode = csz.group(1).strip().title(), csz.group(2), csz.group(3)
+        elif re.match(r'^\d+\s+[A-Z]', line):
+            # Only use line if it's not a doubled/garbled line
+            alpha = [c for c in line if c.isalpha()]
+            if alpha:
+                pairs = sum(1 for i in range(0, len(alpha)-1, 2)
+                            if alpha[i].lower() == alpha[i+1].lower())
+                if pairs / max(len(alpha)//2, 1) < 0.5:
+                    street = line.title()
+
+    return {
+        "street":       street,
+        "apt_suite":    apt_suite,
+        "city":         city,
+        "state":        state,
+        "zip":          zipcode,
+        "full_address": ", ".join(filter(None, [
+            street, f"{city} {state} {zipcode}" if city else None
+        ]))
+    }
+
+
 def parse_everbank(pages):
     """
     EverBank layout:
       Page 1 — header, address, account summary table
-      Page 2 — transaction detail per account section
+               NOTE: Page 1 often has broken font encoding (chars doubled/tripled)
+               Use page 2 for clean account holder name and statement date.
+      Page 2 — transaction detail per account section (CLEAN text)
       Page 3 — legal disclaimer (skip)
     """
-    p1 = pages[0] if len(pages) > 0 else ""
-    p2 = pages[1] if len(pages) > 1 else ""
+    p1_raw = pages[0] if len(pages) > 0 else ""
+    p2     = pages[1] if len(pages) > 1 else ""
+
+    # Apply per-line dedup fix to page 1
+    p1 = fix_everbank_doubled_text(p1_raw)
 
     result = {}
-
-    # ── Bank name
     result["bank_name"] = "EverBank"
 
-    # ── Statement reference number (appears next to "Statement of Account")
+    # ── Statement reference number
+    # Try page 1 first, then page 2 (clean)
     m = re.search(r'Statement\s+of\s+Account\s*\n?\s*(\d{7,15})', p1, re.I)
+    if not m:
+        m = re.search(r'\b(\d{10})\b', p2)  # bare account number on page 2
     result["statement_reference_no"] = m.group(1) if m else None
 
-    # ── Account holder — first ALL-CAPS line block in page 1
+    # ── Account holder
+    # Page 2 has a CLEAN title-case name right after the account number line
+    # e.g. "3403437034\nKrishnakumar Muthuselvan\nPage 2"
     holder = None
-    for line in p1.splitlines():
-        line = line.strip()
-        # Match full name in ALL CAPS (2+ words, letters and spaces only)
-        if re.match(r'^[A-Z]{2,}(?:\s+[A-Z]{2,})+$', line):
-            holder = line
-            break
+    p2_lines = [l.strip() for l in p2.splitlines() if l.strip()]
+    for i, line in enumerate(p2_lines):
+        if re.match(r'^\d{7,15}$', line) and i + 1 < len(p2_lines):
+            candidate = p2_lines[i + 1]
+            # Title-case name, not "Page N" or a date
+            if re.match(r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+$', candidate):
+                holder = candidate.upper()  # normalise to ALL-CAPS
+                break
+
+    # Fallback: page 1 fixed text
+    if not holder:
+        for line in p1.splitlines():
+            line = line.strip()
+            if re.match(r'^[A-Z]{2,}(?:\s+[A-Z]{2,})+$', line):
+                holder = line
+                break
+
     result["account_holder"] = holder
 
-    # ── Mailing address — lines right after the holder name (fully parsed)
-    lines = [l.strip() for l in p1.splitlines() if l.strip()]
-    result["mailing_address"] = {}
-    for i, line in enumerate(lines):
-        if line == holder:
-            result["mailing_address"] = parse_address_block(lines, i)
-            break
+    # ── Mailing address — EverBank page 1 is two-column layout
+    # pdfplumber merges both columns: "748 BAROSSA VALLEY DR NW  Days in stmt period: 90"
+    # Use dedicated extractor that strips right-column noise
+    result["mailing_address"] = _extract_everbank_address(p1_raw, holder or "")
 
-    # ── Statement date
+    # ── Statement date — prefer page 2 (clean), fallback page 1
     m = re.search(
         r'((?:January|February|March|April|May|June|July|August|'
         r'September|October|November|December)\s+\d{1,2},\s*\d{4})',
-        p1, re.I)
+        p2 + "\n" + p1, re.I)
     result["statement_date"] = m.group(1) if m else None
 
     # ── Statement period days
-    m = re.search(r'Days\s+in\s+stmt\s+period[:\s]*(\d+)', p1, re.I)
+    m = re.search(r'Days\s+in\s+stmt\s+period[:\s]*(\d+)', p1 + p2, re.I)
     result["stmt_period_days"] = m.group(1) if m else None
 
     # ── Inquiry phone
