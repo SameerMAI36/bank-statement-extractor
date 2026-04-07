@@ -174,6 +174,328 @@ def parse_address_block(lines, holder_idx):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  DCU (DIGITAL FEDERAL CREDIT UNION) VISA CREDIT CARD EXTRACTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def is_dcu(pages):
+    return any(re.search(r'digital\s+federal\s+credit\s+union|DCU\s+VISA', p, re.I) for p in pages)
+
+
+def parse_dcu(pages):
+    """
+    DCU Visa Credit Card statement layout:
+      Page 1: Holder name + address (top), card number, account summary,
+              transactions (purchases in left col, credits in right col)
+      Page 2: Legal / terms (skip)
+      Page 3: Transactions continued, fees, interest, APR table
+    """
+    p1        = pages[0] if pages else ""
+    all_text  = "\n".join(pages)
+    lines     = [l.strip() for l in p1.splitlines() if l.strip()]
+
+    result = {"bank_name": "Digital Federal Credit Union (DCU)"}
+
+    # ── Statement type
+    result["statement_type"] = "Visa Credit Card"
+
+    # ── Account holder — line index 1 (after "Visa Credit Card Bill")
+    result["account_holder"] = lines[1] if len(lines) > 1 else None
+
+    # ── Mailing address — lines 2, 3 (apt), 4 (city state zip)
+    raw_addr = []
+    for line in lines[2:6]:
+        if re.match(r'^[A-Z0-9]', line) and not re.search(r'CARD\s+NUMBER|Summary|XXXX', line):
+            raw_addr.append(line)
+        else:
+            break
+
+    street, apt_suite, city, state, zipcode = None, None, None, None, None
+    if raw_addr:
+        # Check if last addr line is City ST ZIP
+        csz = re.match(r'^([A-Za-z\s]+)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)', raw_addr[-1])
+        if csz:
+            city, state, zipcode = csz.group(1).strip().title(), csz.group(2), csz.group(3)
+            street_lines = raw_addr[:-1]
+        else:
+            street_lines = raw_addr
+
+        if len(street_lines) >= 2:
+            street    = street_lines[0].title()
+            apt_suite = street_lines[1].title()
+        elif len(street_lines) == 1:
+            street = street_lines[0].title()
+
+    result["mailing_address"] = {
+        "street":       street,
+        "apt_suite":    apt_suite,
+        "city":         city,
+        "state":        state,
+        "zip":          zipcode,
+        "full_address": ", ".join(filter(None, [
+            apt_suite, street,
+            f"{city} {state} {zipcode}" if city else None
+        ]))
+    }
+
+    # ── Card / account identifiers
+    m = re.search(r'(XXXX-XXXX-XXXX-\d{4})', all_text)
+    result["card_number"]  = m.group(1) if m else None
+
+    m = re.search(r'DCU\s+VISA\s+LN#\s*(\d+)', all_text, re.I)
+    result["loan_number"]  = m.group(1) if m else None
+
+    m = re.search(r'Member\s+Number\s+(\d+)', all_text, re.I)
+    result["member_number"] = m.group(1) if m else None
+
+    # ── Summary fields
+    def fm(pat, text=p1):
+        hit = re.search(pat, text, re.I)
+        return hit.group(1).strip() if hit else None
+
+    result["starting_balance"]    = fm(r'Starting Balance\s+([\d,]+\.\d{2})')
+    result["new_balance"]         = fm(r'New Balance\s+([\d,]+\.\d{2})')
+    result["payments"]            = fm(r'Payments\s+(-[\d,]+\.\d{2})')
+    result["other_credits"]       = fm(r'Other Credits\s+(-[\d,]+\.\d{2})')
+    result["purchases"]           = fm(r'Purchases\s+([\d,]+\.\d{2})')
+    result["cash_advances"]       = fm(r'Cash Advances\s+([\d,]+\.\d{2})')
+    result["other_debits"]        = fm(r'Other Debits\s+([\d,]+\.\d{2})')
+    result["fees_charged"]        = fm(r'Fees Charged\s+([\d,]+\.\d{2})')
+    result["interest_charged"]    = fm(r'Interest Charged\s+([\d,]+\.\d{2})')
+    result["credit_limit"]        = fm(r'Credit Limit\s+([\d,]+\.\d{2})')
+    result["available_credit"]    = fm(r'Available Credit\s+([\d,]+\.\d{2})')
+    result["minimum_payment_due"] = fm(r'Minimum Payment Due\s+([\d,]+\.\d{2})')
+    result["past_due_amount"]     = fm(r'Past Due Amount\s+([\d,]+\.\d{2})')
+    result["due_date"]            = fm(r'Due Date\s+(\d{2}/\d{2}/\d{2})')
+    result["statement_date"]      = fm(r'Statement Closing Date\s+(\d{2}/\d{2}/\d{2})')
+    result["days_in_period"]      = fm(r'Days in Period\s+(\d+)')
+
+    # ── APR from interest calculation table (page 3)
+    m = re.search(r'STD PURCHASE\s+[\d,\.]+\s+[\d\.]+%\s+([\d\.]+)\(', all_text, re.I)
+    result["apr"] = f"{m.group(1)}%" if m else None
+
+    # ── Total fees/interest YTD
+    result["total_fees_ytd"]     = fm(r'TOTAL FEES CHARGED IN \d{4}\s+([\d,]+\.\d{2})', all_text)
+    result["total_interest_ytd"] = fm(r'TOTAL INTEREST CHARGED IN \d{4}\s+([\d,]+\.\d{2})', all_text)
+
+    # ── Transactions
+    result["transactions"] = parse_dcu_transactions(pages)
+
+    return result
+
+
+def parse_dcu_transactions(pages):
+    """
+    DCU transaction rows:  MM/DD  MM/DD  DESCRIPTION  AMOUNT
+    A 'CREDIT CARD CREDIT' label on the line before marks the next row as a credit.
+    Purchases go in the left (Purchases & Advances) column.
+    Credits go in the right (Payments & Credits) column.
+    """
+    txns        = []
+    credit_flag = False
+    skip        = re.compile(
+        r'^(Transaction|Posting|Date|Purchases|Payments|Fees|Interest|'
+        r'TOTAL|Description|Balance\s+Type|STD\s+|THE\s+BALANCE|ADDING|'
+        r'OF\s+DAYS|CREDITS\.|PURCHASE|Page|Transactions|Totals|'
+        r'\(V\)\s+INDICATES)', re.I)
+
+    txn_pat = re.compile(
+        r'^(\d{2}/\d{2})\s+(\d{2}/\d{2})\s+(.+?)\s+([\d,]+\.\d{2})\s*$'
+    )
+
+    for page_text in pages:
+        for line in page_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if 'CREDIT CARD CREDIT' in line:
+                credit_flag = True
+                continue
+            if skip.match(line):
+                continue
+            m = txn_pat.match(line)
+            if m:
+                amount = float(m.group(4).replace(',', ''))
+                txn_type = "Credit" if credit_flag else "Purchase"
+                txns.append({
+                    "Transaction Date": m.group(1),
+                    "Posting Date":     m.group(2),
+                    "Description":      m.group(3).strip(),
+                    "Amount":           m.group(4),
+                    "Type":             txn_type,
+                })
+                credit_flag = False
+
+    return txns
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BANK OF AMERICA EXTRACTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def is_bofa(pages):
+    return any(re.search(r'Bank\s+of\s+America', p, re.I) for p in pages)
+
+
+def parse_bofa(pages):
+    """
+    Bank of America layout (multi-statement joint PDF):
+      - Two-column header: customer address on left, bank info on right
+      - Joint account: two ALL-CAPS holder names
+      - Address lines mixed with bank info on same pdfplumber line
+      - Transactions: MM/DD/YY  Description  Amount  (no running balance column)
+      - Multiple statement periods may be in one PDF
+    """
+    p1    = pages[0] if pages else ""
+    lines = [l.strip() for l in p1.splitlines() if l.strip()]
+    full_text = "\n".join(pages)
+
+    result = {"bank_name": "Bank of America"}
+
+    # ── Account holders
+    # Line like: "SAMEER RAJASIMHASANA MATAM bankofamerica.com"
+    # Second:    "SHRUTHI SHARMA NAGASAMUDRA MATADA"  (clean)
+    holders = []
+    for line in lines:
+        # Strip trailing website / bank noise from end of line
+        clean = re.sub(r'\s+(?:bankofamerica\.com|Bank\s+of\s+America.*|P\.O\..*|Tampa.*)$', '', line).strip()
+        if re.match(r'^[A-Z]{2,}(?:\s+[A-Z]{2,})+$', clean):
+            holders.append(clean)
+        if len(holders) == 2:
+            break
+    result["account_holder"]        = holders[0] if holders else None
+    result["co_account_holder"]     = holders[1] if len(holders) > 1 else None
+
+    # ── Mailing address
+    # Street line: "1052 ALAMEDA CIR Bank of America, N.A." → extract before bank name
+    # City line:   "CORINTH, TX 76210-1743"  (clean, comes 2 lines after street)
+    street, city, state, zip_code = None, None, None, None
+    for i, line in enumerate(lines):
+        # Detect street: starts with number, has ALL-CAPS words, followed by bank noise
+        m = re.match(r'^(\d+\s+[A-Z0-9\s]+?)\s+(?:Bank\s+of\s+America|P\.O\.|Tampa)', line)
+        if m:
+            street = m.group(1).strip().title()
+            # City/State/ZIP is typically 2 lines later
+            for j in range(i + 1, min(i + 4, len(lines))):
+                csz = re.match(r'^([A-Za-z\s]+),\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)', lines[j])
+                if csz:
+                    city      = csz.group(1).strip().title()
+                    state     = csz.group(2)
+                    zip_code  = csz.group(3)
+                    break
+            break
+
+    result["mailing_address"] = {
+        "street":       street,
+        "city":         city,
+        "state":        state,
+        "zip":          zip_code,
+        "full_address": ", ".join(filter(None, [
+            street,
+            f"{city} {state} {zip_code}" if city else None
+        ]))
+    }
+
+    # ── Account number
+    m = re.search(r'Account\s+number:\s*([\d\s]+)', p1, re.I)
+    result["account_number"] = m.group(1).strip() if m else None
+
+    # ── Account type (from "Your Bank of America Advantage Savings")
+    m = re.search(r'Your\s+(Bank\s+of\s+America\s+[\w\s]+?)(?:\n|for\s)', p1, re.I)
+    result["account_type"] = m.group(1).strip() if m else "Bank of America Savings"
+
+    # ── Statement period (first period — PDF may contain multiple)
+    m = re.search(r'for\s+([\w]+ \d+,\s*\d{4})\s+to\s+([\w]+ \d+,\s*\d{4})', p1, re.I)
+    result["statement_period"] = f"{m.group(1)} to {m.group(2)}" if m else None
+    result["statement_date"]   = m.group(2) if m else None
+
+    # ── Customer service phone
+    m = re.search(r'Customer\s+service:\s*([\d\.]+)', p1, re.I)
+    result["inquiry_phone"] = m.group(1) if m else None
+
+    # ── Balances (from account summary block on page 1)
+    def bal(pattern):
+        hit = re.search(pattern, p1, re.I)
+        return f"${hit.group(1)}" if hit else None
+
+    result["opening_balance"] = bal(r'Beginning balance on .+?\$(\d[\d,]+\.\d{2})')
+    result["ending_balance"]  = bal(r'Ending balance on .+?\$(\d[\d,]+\.\d{2})')
+    result["total_deposits"]  = bal(r'Deposits and other additions\s+([\d,]+\.\d{2})')
+    result["service_fees"]    = bal(r'Service fees\s+(-[\d,]+\.\d{2})')
+    result["other_subs"]      = bal(r'Other subtractions\s+(-[\d,]+\.\d{2})')
+
+    # ── Interest / APY
+    m = re.search(r'Annual Percentage Yield Earned.*?:\s*([\d\.]+%)', p1, re.I)
+    result["apy_earned"] = m.group(1) if m else None
+    m = re.search(r'Interest Paid Year To Date:\s*\$([\d\.]+)', p1, re.I)
+    result["interest_ytd"] = f"${m.group(1)}" if m else None
+
+    # ── All transactions across every page (handles multi-period PDF)
+    result["transactions"] = parse_bofa_transactions(pages)
+
+    return result
+
+
+def parse_bofa_transactions(pages):
+    """
+    BoA transaction rows: MM/DD/YY  Description  Amount
+    Amount is positive for credits, negative for debits.
+    Multi-line descriptions (continuation lines like 'CO ID:...') are merged.
+    """
+    txns = []
+    skip = re.compile(
+        r'^(Total|Note|Date|Braille|PULL|Page|IMPORTANT|BANK\s+DEPOSIT|'
+        r'How\s+to|Deposit\s+agreement|Electronic|Reporting|Direct\s+dep|'
+        r'For\s+consumer|For\s+other|©|Bank\s+of\s+America,\s+N\.A\.|'
+        r'Deposits\s+and|Withdrawals\s+and|Other\s+subtractions|Service\s+fees|'
+        r'ATM\s+and|Beginning|Ending|Annual|Interest\s+Paid)',
+        re.I
+    )
+    txn_pat = re.compile(r'^(\d{2}/\d{2}/\d{2})\s+(.+?)\s+(-?[\d,]+\.\d{2})\s*$')
+
+    for page_text in pages:
+        prev_txn = None
+        for line in page_text.splitlines():
+            line = line.strip()
+            if not line or skip.match(line):
+                continue
+            m = txn_pat.match(line)
+            if m:
+                if prev_txn:
+                    txns.append(prev_txn)
+                amount = m.group(3).replace(',', '')
+                prev_txn = {
+                    "Date":        m.group(1),
+                    "Description": m.group(2).strip(),
+                    "Amount":      m.group(3),
+                    "Type":        "Credit" if float(amount) > 0 else "Debit",
+                }
+            elif prev_txn and not re.match(r'^\d{2}/\d{2}/\d{2}', line):
+                # Continuation line (e.g. "CO ID:9111111103 PPD") — append to description
+                # Strip BoA footer noise that bleeds onto continuation lines
+                clean_line = re.sub(
+                    r'\s*bankofamerica\.com.*$|'
+                    r'\s*Braille and Large Print.*$|'
+                    r'\s*You can request a copy.*$',
+                    '', line, flags=re.I
+                ).strip()
+                if clean_line and not skip.match(clean_line):
+                    prev_txn["Description"] += " " + clean_line
+        if prev_txn:
+            txns.append(prev_txn)
+            prev_txn = None
+
+    # Deduplicate (same date+description+amount may appear from overlapping pages)
+    seen = set()
+    unique = []
+    for t in txns:
+        key = (t["Date"], t["Amount"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(t)
+    return unique
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  EVERBANK-SPECIFIC EXTRACTORS  (multi-page format)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -438,7 +760,13 @@ def parse_generic(pages):
 
 def extract(pdf_path):
     pages, method = get_pages(pdf_path)
-    if is_everbank(pages):
+    if is_dcu(pages):
+        details = parse_dcu(pages)
+        fmt     = "DCU"
+    elif is_bofa(pages):
+        details = parse_bofa(pages)
+        fmt     = "Bank of America"
+    elif is_everbank(pages):
         details = parse_everbank(pages)
         fmt     = "EverBank"
     else:
@@ -495,8 +823,138 @@ with st.spinner("🔍 Extracting data from PDF..."):
 
 st.success(f"✅ Done — Format detected: **{fmt}** | Extraction: **{method}**")
 
+# ── DCU Credit Card Layout ────────────────────────────────────────────────────
+if fmt == "DCU":
+    col_l, col_r = st.columns(2, gap="large")
+
+    with col_l:
+        section("💳 Card & Account Info")
+        field("Bank Name",          details.get("bank_name"))
+        field("Statement Type",     details.get("statement_type"))
+        field("Card Number",        details.get("card_number"))
+        field("Loan Number",        details.get("loan_number"))
+        field("Member Number",      details.get("member_number"))
+        field("Account Holder",     details.get("account_holder"))
+
+        section("📮 Mailing Address")
+        addr = details.get("mailing_address", {})
+        if addr.get("apt_suite"): field("Apt / Suite", addr.get("apt_suite"))
+        field("Street",   addr.get("street"))
+        field("City",     addr.get("city"))
+        c1, c2 = st.columns(2)
+        with c1: field("State", addr.get("state"))
+        with c2: field("ZIP",   addr.get("zip"))
+        if addr.get("full_address"):
+            field("Full Address", addr.get("full_address"))
+
+    with col_r:
+        section("📅 Statement Info")
+        field("Statement Closing Date", details.get("statement_date"))
+        field("Due Date",               details.get("due_date"))
+        field("Days in Period",         details.get("days_in_period"))
+        field("APR",                    details.get("apr"))
+
+        section("💰 Account Summary")
+        b1, b2 = st.columns(2)
+        with b1: bal_card("Starting Balance", details.get("starting_balance"))
+        with b2: bal_card("New Balance",      details.get("new_balance"))
+
+        b3, b4 = st.columns(2)
+        with b3: bal_card("Credit Limit",     details.get("credit_limit"))
+        with b4: bal_card("Available Credit", details.get("available_credit"))
+
+        section("📊 Activity Summary")
+        field("Purchases",           details.get("purchases"))
+        field("Payments",            details.get("payments"))
+        field("Other Credits",       details.get("other_credits"))
+        field("Other Debits",        details.get("other_debits"))
+        field("Fees Charged",        details.get("fees_charged"))
+        field("Interest Charged",    details.get("interest_charged"))
+
+        section("⚠️ Payment Info")
+        field("Minimum Payment Due", details.get("minimum_payment_due"))
+        field("Past Due Amount",     details.get("past_due_amount"))
+        field("Total Fees YTD",      details.get("total_fees_ytd"))
+        field("Total Interest YTD",  details.get("total_interest_ytd"))
+
+    st.divider()
+    txns = details.get("transactions", [])
+    section(f"📋 Transactions ({len(txns)} total)")
+    if txns:
+        import pandas as pd
+        df = pd.DataFrame(txns)
+        st.dataframe(df, use_container_width=True, hide_index=True,
+                     column_config={
+                         "Transaction Date": st.column_config.TextColumn("Txn Date",    width="small"),
+                         "Posting Date":     st.column_config.TextColumn("Posted",      width="small"),
+                         "Description":      st.column_config.TextColumn("Description", width="large"),
+                         "Amount":           st.column_config.TextColumn("Amount",      width="small"),
+                         "Type":             st.column_config.TextColumn("Type",        width="small"),
+                     })
+    else:
+        st.warning("No transactions found.")
+
+# ── Bank of America Layout ────────────────────────────────────────────────────
+elif fmt == "Bank of America":
+    col_l, col_r = st.columns(2, gap="large")
+
+    with col_l:
+        section("🏦 Bank & Account Info")
+        field("Bank Name",          details.get("bank_name"))
+        field("Account Type",       details.get("account_type"))
+        field("Account Number",     details.get("account_number"))
+        field("Primary Holder",     details.get("account_holder"))
+        field("Co-Account Holder",  details.get("co_account_holder"))
+        field("Customer Service",   details.get("inquiry_phone"))
+
+        section("📮 Mailing Address")
+        addr = details.get("mailing_address", {})
+        if addr:
+            field("Street",   addr.get("street"))
+            field("City",     addr.get("city"))
+            c1, c2 = st.columns(2)
+            with c1: field("State", addr.get("state"))
+            with c2: field("ZIP",   addr.get("zip"))
+            if addr.get("full_address"):
+                field("Full Address", addr.get("full_address"))
+        else:
+            st.markdown('<div class="warn-card">⚠️ No address found.</div>', unsafe_allow_html=True)
+
+    with col_r:
+        section("📅 Statement Info")
+        field("Statement Period",   details.get("statement_period"))
+        field("Statement Date",     details.get("statement_date"))
+        field("APY Earned",         details.get("apy_earned"))
+        field("Interest YTD",       details.get("interest_ytd"))
+
+        section("💰 Account Summary")
+        b1, b2 = st.columns(2)
+        with b1: bal_card("Opening Balance", details.get("opening_balance"))
+        with b2: bal_card("Ending Balance",  details.get("ending_balance"))
+        b3, b4 = st.columns(2)
+        with b3: bal_card("Total Deposits",  details.get("total_deposits"))
+        with b4: bal_card("Service Fees",    details.get("service_fees"))
+        if details.get("other_subs"):
+            field("Other Subtractions", details.get("other_subs"))
+
+    st.divider()
+    txns = details.get("transactions", [])
+    section(f"📋 Transaction History ({len(txns)} transactions across all statement periods)")
+    if txns:
+        import pandas as pd
+        df = pd.DataFrame(txns)
+        st.dataframe(df, use_container_width=True, hide_index=True,
+                     column_config={
+                         "Date":        st.column_config.TextColumn("Date",         width="small"),
+                         "Description": st.column_config.TextColumn("Description",  width="large"),
+                         "Amount":      st.column_config.TextColumn("Amount",       width="small"),
+                         "Type":        st.column_config.TextColumn("Type",         width="small"),
+                     })
+    else:
+        st.warning("No transactions found.")
+
 # ── EverBank Layout ───────────────────────────────────────────────────────────
-if fmt == "EverBank":
+elif fmt == "EverBank":
     col_l, col_r = st.columns(2, gap="large")
 
     with col_l:
