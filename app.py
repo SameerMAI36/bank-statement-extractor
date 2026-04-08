@@ -712,52 +712,95 @@ def parse_everbank(pages):
     result["account_number"] = accounts[0]["account_number"] if accounts else None
     result["ending_balance"] = accounts[0]["ending_balance"] if accounts else None
 
-    # ── Transactions from page 2
-    #    Format: MM-DD  Description  [Additions]  [Subtractions]  Balance
-    result["transactions"] = parse_everbank_transactions(p2)
+    # ── Per-account sections from pages 2+ (multi-account support)
+    # Each section starts with "EverBank <Type> <AccountNumber>"
+    all_body = "\n".join(pages[1:])  # skip page 1 summary
+    result["account_sections"] = parse_everbank_account_sections(all_body, accounts)
 
-    # ── Interest / APY details from page 2
-    result["interest_details"] = parse_everbank_interest(p2)
+    # Backward-compat: first account's transactions + interest
+    if result["account_sections"]:
+        result["transactions"]    = result["account_sections"][0].get("transactions", [])
+        result["interest_details"] = result["account_sections"][0].get("interest_details", {})
+    else:
+        result["transactions"]    = parse_everbank_transactions(p2)
+        result["interest_details"] = parse_everbank_interest(p2)
 
     return result
 
 
+def parse_everbank_account_sections(body_text, accounts):
+    """
+    Split body pages into per-account sections and parse each one.
+    Sections are delimited by headers like: 'EverBank Performance Savings 1117169388'
+    """
+    section_pat = re.compile(
+        r'^(EverBank\s+[\w\s]+?)\s+(\d{7,15})\s*$', re.I | re.MULTILINE
+    )
+
+    # Find all section start positions
+    starts = [(m.start(), m.group(1).strip(), m.group(2)) for m in section_pat.finditer(body_text)]
+    if not starts:
+        return []
+
+    sections = []
+    for idx, (pos, acct_type, acct_num) in enumerate(starts):
+        # Text from this section header to next section header (or end)
+        end_pos = starts[idx + 1][0] if idx + 1 < len(starts) else len(body_text)
+        section_text = body_text[pos:end_pos]
+
+        txns  = parse_everbank_transactions(section_text)
+        idet  = parse_everbank_interest(section_text)
+
+        # Find matching summary entry for ending balance
+        ending = next((a["ending_balance"] for a in accounts
+                       if a["account_number"] == acct_num), None)
+
+        sections.append({
+            "account_type":    acct_type,
+            "account_number":  acct_num,
+            "ending_balance":  ending,
+            "transactions":    txns,
+            "interest_details": idet,
+        })
+
+    return sections
+
+
 def parse_everbank_transactions(text):
     """
-    EverBank page 2 transaction format:
-      12-31   Beginning balance                              $0.19
-      03-12   # Internal Transfer Cr  FR ACC 01870899974   1,360.26          1,360.45
-      03-31   # Interest Credit                                1.49           1,361.94
+    EverBank transaction format:
+      12-31   Beginning balance                        $5,120.53
+      01-30   # Interest Credit        14.28           5,134.81
+      03-12   # Internal Transfer Cr   1,360.26        1,360.45
     Columns: Date | Description | Additions | Subtractions | Balance
     """
     txns    = []
-    # Date pattern MM-DD
     row_pat = re.compile(
-        r'^(\d{2}-\d{2})\s+'          # Date MM-DD
-        r'(.+?)'                       # Description
-        r'(?:\s+([\d,]+\.\d{2}))?'    # Additions (optional)
-        r'(?:\s+([\d,]+\.\d{2}))?'    # Subtractions (optional)
-        r'\s+([\d,]+\.\d{2})\s*$',    # Balance
+        r'^(\d{2}-\d{2})\s+'
+        r'(.+?)'
+        r'(?:\s+([\d,]+\.\d{2}))?'
+        r'(?:\s+([\d,]+\.\d{2}))?'
+        r'\s+([\d,]+\.\d{2})\s*$',
         re.MULTILINE
     )
-    skip = re.compile(r'^(Date|Description|Additions|Subtractions|Balance)', re.I)
+    skip = re.compile(r'^(Date|Description|Additions|Subtractions|Balance|EverBank\s+Performance)', re.I)
 
     for m in row_pat.finditer(text):
         desc = m.group(2).strip()
         if skip.match(desc):
             continue
         txns.append({
-            "Date":          m.group(1),
-            "Description":   desc,
-            "Additions":     "$" + m.group(3) if m.group(3) else "",
-            "Subtractions":  "$" + m.group(4) if m.group(4) else "",
-            "Balance":       "$" + m.group(5),
+            "Date":         m.group(1),
+            "Description":  desc,
+            "Additions":    "$" + m.group(3) if m.group(3) else "",
+            "Subtractions": "$" + m.group(4) if m.group(4) else "",
+            "Balance":      "$" + m.group(5),
         })
     return txns
 
 
 def parse_everbank_interest(text):
-    """Extract APY / interest summary block from page 2."""
+    """Extract APY / interest summary from a section block."""
     info = {}
     patterns = {
         "interest_paid_ytd":     r'Interest\s+paid\s+YTD\s+\$?([\d,]+\.\d{2})',
@@ -773,8 +816,149 @@ def parse_everbank_interest(text):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  GENERIC EXTRACTOR (non-EverBank)
+#  CONFIDENCE SCORING
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _score_field(value, field_type="generic", source="direct"):
+    """
+    Score a single extracted field 0–100.
+    field_type: account_number | account_holder | address_street | address_city |
+                address_state  | address_zip    | date           | balance | phone | generic
+    source:     direct (pdfplumber clean) | fixed (dedup applied) | ocr | fallback
+    Returns: (score, label, reason)
+    """
+    if not value or str(value).strip() in ("—", "None", ""):
+        return 0, "Not Found", "Field could not be extracted"
+
+    val     = str(value).strip()
+    score   = 100
+    reasons = []
+
+    # Source penalty
+    penalty = {"direct": 0, "fixed": 10, "ocr": 20, "fallback": 15}
+    score  -= penalty.get(source, 0)
+    if source != "direct":
+        reasons.append(f"via {source} extraction")
+
+    if field_type == "account_number":
+        if re.match(r'^[X\*\d][\dX\*\-\s]{5,}$', val):
+            pass  # masked or plain — valid
+        else:
+            score -= 30; reasons.append("unexpected format")
+
+    elif field_type == "account_holder":
+        words = val.split()
+        if len(words) < 2:
+            score -= 35; reasons.append("single word")
+        if re.search(r'\d', val):
+            score -= 30; reasons.append("contains digits")
+        if len(val) > 65:
+            score -= 20; reasons.append("unusually long")
+        alpha = [c for c in val if c.isalpha()]
+        if alpha:
+            pairs = sum(1 for i in range(0, len(alpha)-1, 2)
+                        if alpha[i].lower() == alpha[i+1].lower())
+            if pairs / max(len(alpha)//2, 1) > 0.4:
+                score -= 35; reasons.append("possible character doubling")
+
+    elif field_type == "address_street":
+        if not re.match(r'^\d+\s+\w+', val):
+            score -= 20; reasons.append("no street number")
+        if len(val) < 5:
+            score -= 40; reasons.append("too short")
+
+    elif field_type == "address_city":
+        if not re.match(r'^[A-Za-z\s]{2,}$', val):
+            score -= 25; reasons.append("unexpected characters")
+
+    elif field_type == "address_state":
+        if not re.match(r'^[A-Z]{2}$', val):
+            score -= 40; reasons.append("not a 2-letter state code")
+
+    elif field_type == "address_zip":
+        if not re.match(r'^\d{5}(-\d{4})?$', val):
+            score -= 40; reasons.append("invalid ZIP format")
+
+    elif field_type == "date":
+        if re.match(r'^(January|February|March|April|May|June|July|August|'
+                    r'September|October|November|December)\s+\d{1,2},\s*\d{4}$', val, re.I):
+            pass
+        elif re.match(r'^\d{1,2}/\d{1,2}/\d{2,4}$', val):
+            pass
+        else:
+            score -= 20; reasons.append("non-standard format")
+
+    elif field_type == "balance":
+        if re.match(r'^-?\$?[\d,]+\.\d{2}$', val):
+            pass
+        else:
+            score -= 30; reasons.append("invalid balance format")
+
+    elif field_type == "phone":
+        if len(re.sub(r'\D', '', val)) not in (10, 11):
+            score -= 30; reasons.append("unexpected format")
+
+    score   = max(0, min(100, score))
+    label   = "High" if score >= 85 else "Medium" if score >= 60 else "Low" if score >= 30 else "Not Found"
+    reason  = "; ".join(reasons) if reasons else "Matches expected format"
+    return score, label, reason
+
+
+def calculate_confidence(details, fmt):
+    """
+    Score extraction confidence 0–100% per field and overall.
+    Returns: (overall_pct, field_scores_dict)
+    field_scores_dict values: (score, label, reason)
+    """
+    addr    = details.get("mailing_address") or {}
+    src     = "fixed" if fmt == "EverBank" else "direct"
+
+    # ── Per-field scores (score, label, reason)
+    holder  = details.get("account_holder") or details.get("co_account_holder") or ""
+    acct_no = (details.get("account_number") or
+               (details.get("accounts") or [{}])[0].get("account_number") or
+               details.get("card_number") or "")
+
+    date_val = (details.get("statement_date") or
+                details.get("due_date") or "")
+
+    # Balance — take whatever is available per format
+    if fmt == "EverBank":
+        bal = (details.get("accounts") or [{}])[0].get("ending_balance") or ""
+    elif fmt == "Bank of America":
+        bal = details.get("ending_balance") or details.get("opening_balance") or ""
+    elif fmt == "DCU":
+        bal = details.get("new_balance") or details.get("starting_balance") or ""
+    else:
+        bal = details.get("closing_balance") or details.get("ending_balance") or ""
+
+    txn_count = len(details.get("transactions", []))
+
+    scores = {
+        "Account Holder":  _score_field(holder,          "account_holder",  src),
+        "Account Number":  _score_field(acct_no,         "account_number",  "direct"),
+        "Statement Date":  _score_field(date_val,        "date",            "direct"),
+        "Street":          _score_field(addr.get("street"),  "address_street", src),
+        "City":            _score_field(addr.get("city"),    "address_city",   src),
+        "State":           _score_field(addr.get("state"),   "address_state",  src),
+        "ZIP":             _score_field(addr.get("zip"),     "address_zip",    src),
+        "Balance":         _score_field(bal,             "balance",         "direct"),
+        "Transactions":    (min(100, txn_count * 15) if txn_count else 0,
+                            "High" if txn_count >= 5 else "Medium" if txn_count >= 1 else "Not Found",
+                            f"{txn_count} transaction(s) found"),
+    }
+
+    # Weighted overall score
+    weights = {
+        "Account Holder": 20, "Account Number": 20, "Statement Date": 10,
+        "Street": 10, "City": 8, "State": 5, "ZIP": 7,
+        "Balance": 10, "Transactions": 10,
+    }
+    total_w = sum(weights.values())
+    overall = round(sum(scores[k][0] * weights[k] for k in scores) / total_w)
+    return overall, scores
+
+
 
 def parse_generic(pages):
     text = "\n".join(pages)
@@ -899,7 +1083,9 @@ def extract(pdf_path):
     else:
         details = parse_generic(pages)
         fmt     = "Generic"
-    return details, method, fmt, "\n\n--- PAGE BREAK ---\n\n".join(pages)
+
+    confidence, field_scores = calculate_confidence(details, fmt)
+    return details, method, fmt, "\n\n--- PAGE BREAK ---\n\n".join(pages), confidence, field_scores
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -944,11 +1130,51 @@ with st.spinner("🔍 Extracting data from PDF..."):
         tmp.write(uploaded.read())
         tmp_path = tmp.name
     try:
-        details, method, fmt, raw_text = extract(tmp_path)
+        details, method, fmt, raw_text, confidence, field_scores = extract(tmp_path)
     finally:
         os.unlink(tmp_path)
 
-st.success(f"✅ Done — Format detected: **{fmt}** | Extraction: **{method}**")
+# ── Confidence banner ─────────────────────────────────────────────────────────
+conf_color = "#22c55e" if confidence >= 85 else "#f59e0b" if confidence >= 60 else "#ef4444"
+conf_label = "High" if confidence >= 85 else "Medium" if confidence >= 60 else "Low"
+conf_icon  = "🟢" if confidence >= 85 else "🟡" if confidence >= 60 else "🔴"
+st.markdown(f"""
+<div style="background:{conf_color}18; border-left:4px solid {conf_color};
+     border-radius:8px; padding:14px 20px; margin:10px 0; display:flex;
+     align-items:center; gap:20px;">
+  <div style="font-size:36px; font-weight:900; color:{conf_color}; line-height:1">
+    {confidence}%</div>
+  <div>
+    <div style="font-size:14px; font-weight:700; color:{conf_color}">
+      {conf_icon} {conf_label} Confidence Extraction</div>
+    <div style="font-size:12px; color:#64748b; margin-top:2px;">
+      Format detected: <b>{fmt}</b> &nbsp;|&nbsp; Extraction method: <b>{method}</b>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+with st.expander("📊 Field-level confidence breakdown"):
+    # field_scores values are (score, label, reason) tuples
+    items = list(field_scores.items())
+    # Display in rows of 3
+    for row_start in range(0, len(items), 3):
+        row = items[row_start:row_start+3]
+        cols = st.columns(len(row))
+        for col, (fname, fdata) in zip(cols, row):
+            fscore, flabel, freason = fdata if isinstance(fdata, tuple) else (fdata, "", "")
+            fc = "#22c55e" if fscore >= 85 else "#f59e0b" if fscore >= 60 else "#ef4444" if fscore >= 30 else "#94a3b8"
+            ficon = "✅" if fscore >= 85 else "🟡" if fscore >= 60 else "🔴" if fscore >= 30 else "⚫"
+            col.markdown(f"""
+            <div style="background:{fc}12; border:1px solid {fc}40; border-radius:8px;
+                 padding:10px 12px; text-align:center; margin:4px 0;">
+              <div style="font-size:22px; font-weight:800; color:{fc}">{fscore}%</div>
+              <div style="font-size:11px; font-weight:700; color:{fc}; margin:2px 0">
+                {ficon} {flabel}</div>
+              <div style="font-size:10px; color:#475569; text-transform:uppercase;
+                   letter-spacing:0.04em; margin-top:4px">{fname}</div>
+              <div style="font-size:9px; color:#94a3b8; margin-top:3px; font-style:italic">
+                {freason}</div>
+            </div>""", unsafe_allow_html=True)
 
 # ── DCU Credit Card Layout ────────────────────────────────────────────────────
 if fmt == "DCU":
@@ -1086,31 +1312,36 @@ elif fmt == "EverBank":
 
     with col_l:
         section("🏦 Bank & Account Info")
-        field("Bank Name",           details.get("bank_name"))
-        field("Statement Ref No",    details.get("statement_reference_no"))
-        field("Account Holder",      details.get("account_holder"))
+        field("Bank Name",        details.get("bank_name"))
+        field("Statement Ref No", details.get("statement_reference_no"))
+        field("Account Holder",   details.get("account_holder"))
 
         section("📮 Mailing Address")
         addr = details.get("mailing_address", {})
-        if addr.get("apt_suite"): field("Apt / Suite",      addr.get("apt_suite"))
-        field("Street",              addr.get("street"))
-        field("City",                addr.get("city"))
+        if addr.get("apt_suite"): field("Apt / Suite", addr.get("apt_suite"))
+        field("Street",   addr.get("street"))
+        field("City",     addr.get("city"))
         c1, c2 = st.columns(2)
         with c1: field("State", addr.get("state"))
         with c2: field("ZIP",   addr.get("zip"))
         if addr.get("full_address"):
-            field("Full Address",    addr.get("full_address"))
-
-        field("Inquiry Phone",       details.get("inquiry_phone"))
-        field("Bank Address",        details.get("bank_address"))
+            field("Full Address", addr.get("full_address"))
+        field("Inquiry Phone", details.get("inquiry_phone"))
+        field("Bank Address",  details.get("bank_address"))
 
     with col_r:
         section("📅 Statement Info")
-        field("Statement Date",      details.get("statement_date"))
-        field("Period (days)",       details.get("stmt_period_days"))
+        field("Statement Date", details.get("statement_date"))
+        field("Period (days)",  details.get("stmt_period_days"))
 
         section("💰 Account Summary")
         accounts = details.get("accounts", [])
+        acct_sections = details.get("account_sections", [])
+        is_multi = len(accounts) > 1
+
+        if is_multi:
+            st.info(f"📂 This is a **combined statement** with **{len(accounts)} accounts**.")
+
         if accounts:
             for acct in accounts:
                 a1, a2 = st.columns(2)
@@ -1120,36 +1351,71 @@ elif fmt == "EverBank":
                 with a2:
                     bal_card("Ending Balance", acct["ending_balance"])
 
-        # Interest details
-        idet = details.get("interest_details", {})
-        if any(idet.values()):
-            section("📈 Interest Details")
-            i1, i2 = st.columns(2)
-            with i1:
-                field("Interest Paid YTD",    idet.get("interest_paid_ytd"))
-                field("APY Earned",           idet.get("apy_earned"))
-                field("Interest-Bearing Days",idet.get("interest_bearing_days"))
-            with i2:
-                field("Avg Balance for APY",  idet.get("average_balance_apy"))
-                field("Interest Earned",      idet.get("interest_earned"))
+        # Interest details — show first account's or combined
+        if not is_multi:
+            idet = details.get("interest_details", {}) or {}
+            if any(idet.values()):
+                section("📈 Interest Details")
+                i1, i2 = st.columns(2)
+                with i1:
+                    field("Interest Paid YTD",     idet.get("interest_paid_ytd"))
+                    field("APY Earned",             idet.get("apy_earned"))
+                    field("Interest-Bearing Days",  idet.get("interest_bearing_days"))
+                with i2:
+                    field("Avg Balance for APY",    idet.get("average_balance_apy"))
+                    field("Interest Earned",        idet.get("interest_earned"))
 
-    # Transactions
-    st.divider()
-    txns = details.get("transactions", [])
-    section(f"📋 Transaction History ({len(txns)} transactions)")
-    if txns:
-        import pandas as pd
-        df = pd.DataFrame(txns)
-        st.dataframe(df, use_container_width=True, hide_index=True,
-                     column_config={
-                         "Date":         st.column_config.TextColumn("Date",          width="small"),
-                         "Description":  st.column_config.TextColumn("Description",   width="large"),
-                         "Additions":    st.column_config.TextColumn("Additions",     width="small"),
-                         "Subtractions": st.column_config.TextColumn("Subtractions",  width="small"),
-                         "Balance":      st.column_config.TextColumn("Balance",       width="small"),
-                     })
+    # ── Per-account sections (multi-account)
+    if is_multi and acct_sections:
+        st.divider()
+        section(f"📂 Per-Account Detail ({len(acct_sections)} accounts)")
+        for acct_sec in acct_sections:
+            acct_num  = acct_sec["account_number"]
+            acct_type = acct_sec["account_type"]
+            idet      = acct_sec.get("interest_details", {}) or {}
+            txns      = acct_sec.get("transactions", [])
+
+            with st.expander(f"🏦 {acct_type} — {acct_num}  |  Balance: {acct_sec.get('ending_balance','—')}", expanded=True):
+                d1, d2 = st.columns(2)
+                with d1:
+                    field("Account Number",    acct_num)
+                    field("Ending Balance",    acct_sec.get("ending_balance"))
+                    field("Interest Paid YTD", idet.get("interest_paid_ytd"))
+                    field("APY Earned",        idet.get("apy_earned"))
+                with d2:
+                    field("Interest Earned",   idet.get("interest_earned"))
+                    field("Avg Balance APY",   idet.get("average_balance_apy"))
+                    field("Interest-Bearing Days", idet.get("interest_bearing_days"))
+
+                if txns:
+                    import pandas as pd
+                    st.dataframe(pd.DataFrame(txns), use_container_width=True, hide_index=True,
+                                 column_config={
+                                     "Date":         st.column_config.TextColumn("Date",         width="small"),
+                                     "Description":  st.column_config.TextColumn("Description",  width="large"),
+                                     "Additions":    st.column_config.TextColumn("Additions",    width="small"),
+                                     "Subtractions": st.column_config.TextColumn("Subtractions", width="small"),
+                                     "Balance":      st.column_config.TextColumn("Balance",      width="small"),
+                                 })
+                else:
+                    st.warning("No transactions found for this account.")
     else:
-        st.warning("No transactions found — the PDF may use a layout variation not yet handled.")
+        # Single account — show transactions as before
+        st.divider()
+        txns = details.get("transactions", [])
+        section(f"📋 Transaction History ({len(txns)} transactions)")
+        if txns:
+            import pandas as pd
+            st.dataframe(pd.DataFrame(txns), use_container_width=True, hide_index=True,
+                         column_config={
+                             "Date":         st.column_config.TextColumn("Date",         width="small"),
+                             "Description":  st.column_config.TextColumn("Description",  width="large"),
+                             "Additions":    st.column_config.TextColumn("Additions",    width="small"),
+                             "Subtractions": st.column_config.TextColumn("Subtractions", width="small"),
+                             "Balance":      st.column_config.TextColumn("Balance",      width="small"),
+                         })
+        else:
+            st.warning("No transactions found — the PDF may use a layout variation not yet handled.")
 
 # ── Generic Layout ────────────────────────────────────────────────────────────
 else:
